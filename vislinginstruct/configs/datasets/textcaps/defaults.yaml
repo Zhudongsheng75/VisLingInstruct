@@ -1,0 +1,6 @@
+datasets:
+  textcaps:
+    data_type: images # [images|videos|features]
+    build_info:
+      storage: vislinginstruct/data/textCaps
+      vis_root: vislinginstruct/data/textCaps/train_images

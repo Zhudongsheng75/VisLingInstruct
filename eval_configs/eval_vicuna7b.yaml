@@ -1,0 +1,39 @@
+model:
+  arch: my_mmlm_vicuna
+  model_type: eval_vicuna7b
+  # vit encoder
+  image_size: 224
+  drop_path_rate: 0
+  use_grad_checkpoint: False
+  vit_precision: "fp16"
+  freeze_vit: True
+  vit_model_path: "/root/paddlejob/workspace/env_run/afs_01/freeze_weight/eva_vit_g.pth"
+  # Q-Former
+  num_query_token: 32
+  freeze_qformer: True
+  # fc_layer: "/root/paddlejob/workspace/env_run/afs_01/fully_connected_layer/stage1_output/7b/checkpoint_4000.pth"
+  q_former_model: "/root/paddlejob/workspace/env_run/afs_01/qformer/instruct_blip_vicuna7b_trimmed.pth"
+  # q_former_model: "/root/paddlejob/workspace/env_run/afs_01/qformer/instruct_blip_vicuna13b_trimmed.pth"
+  q_former_config: "/root/paddlejob/workspace/env_run/afs_01/freeze_weight/bert-base-uncased"
+  # generation configs
+  prompt: ""
+  # llm_model: "/root/paddlejob/workspace/env_run/afs_01/freeze_weight/vicuna_13b"
+  llm_model: "/root/paddlejob/workspace/env_run/afs_01/freeze_weight/vicuna_7b_v1.1"
+  # llm_model: "/root/paddlejob/workspace/env_run/afs_01/freeze_weight/vicuna-7b"
+  max_txt_len: 512
+  max_output_txt_len: 256
+
+
+preprocess:
+    vis_processor:
+        train:
+          name: "blip2_image_train"
+          image_size: 224
+        eval:
+          name: "blip2_image_eval"
+          image_size: 224
+    text_processor:
+        train:
+          name: "blip_caption"
+        eval:
+          name: "blip_caption"

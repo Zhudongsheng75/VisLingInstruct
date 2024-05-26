@@ -1,0 +1,71 @@
+model:
+  arch: my_mmlm_flant5
+  model_type: flant5
+
+  # vit encoder
+  image_size: 224
+  drop_path_rate: 0
+  use_grad_checkpoint: False
+  vit_precision: "fp16"
+  freeze_vit: True 
+  vit_model_path: "need: the vit model path"
+
+  # Q-Former
+  num_query_token: 32
+  q_former_config: "need: the path for q_former_config"
+  q_former_model: "need: the path for q_former_model"
+  fc_layer: "need: the path for fc-layer can be empty"
+  freeze_qformer: True
+
+  # path to Vicuna checkpoint
+  llm_model: "need: the path for llm"
+
+  # generation configs
+  prompt: "need: can be empty"
+  max_txt_len: 512
+  max_output_txt_len: 256
+
+
+datasets:
+  llava_instruct_150k:
+    data_type: images
+    build_info:
+      storage: "need: data/llava_instruction"
+      vis_root: "need: data/llava_instruction/train2014"
+
+
+run:
+  runner: runner_iter
+
+  task: image_text_pretrain
+  # optimizer
+  lr_sched: "linear_warmup_cosine_lr"
+  init_lr: 1e-5
+  min_lr: 0
+  warmup_lr: 1e-8
+
+  weight_decay: 0.05
+  # max_epoch: 3 
+  accum_grad_iters: 1
+  
+  max_iters: 15000
+  iters_per_inner_epoch: 1000
+
+  batch_size_train: 4
+  batch_size_eval: 1 
+  num_workers: 4
+  warmup_steps: 200
+
+  seed: 42
+  output_dir: "need: the path for saving the model"
+
+  amp: True
+  resume_ckpt_path: null
+
+  evaluate: False 
+  train_splits: ["train"]
+
+  device: "cuda"
+  world_size: 1
+  dist_url: "env://"
+  distributed: True

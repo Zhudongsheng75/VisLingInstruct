@@ -1,0 +1,6 @@
+datasets:
+  textvqa:
+    data_type: images
+    build_info:
+      storage: vislinginstruct/data/textVQA
+      vis_root: vislinginstruct/data/textVQA/train_images

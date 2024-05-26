@@ -1,0 +1,10 @@
+datasets:      
+  llava_instruct_150k: 
+    vis_processor:
+        train:
+          name: "blip_image_train"
+          image_size: 224
+    text_processor:
+        train:
+          name: "blip_caption"
+      

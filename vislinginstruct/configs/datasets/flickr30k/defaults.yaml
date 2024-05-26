@@ -1,0 +1,6 @@
+datasets:
+  flickr30k:
+    data_type: images
+    build_info:
+      storage: vislinginstruct/data/Flickr30K
+      vis_root: vislinginstruct/data/Flickr30K/images

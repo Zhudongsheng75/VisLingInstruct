@@ -1,33 +1,25 @@
 import logging
 import string
-from packaging import version
+import random
+import copy
 
 import torch
-from torch.cuda.amp import autocast as autocast
 import torch.nn as nn
+from torch.cuda.amp import autocast as autocast
+from transformers import T5TokenizerFast
 
-import transformers
+from vislinginstruct.common.registry import registry
+from vislinginstruct.models.blip2 import Blip2Base, disabled_train
+from vislinginstruct.models.modeling_t5 import T5Config, T5ForConditionalGeneration
+from transformers.modeling_outputs import BaseModelOutput
 
-from mmlm.common.registry import registry
-from mmlm.models.blip2 import Blip2Base, disabled_train
 
-
-@registry.register_model("my_mmlm_vicuna")
-class MyMMLMVicunaInstruct(Blip2Base):
-    """
-    BLIP2 Vicuna model.
-    Supported model types:
-        - vicuna7b
-        - vicuna13b
-    Usage:
-        >>> from mmlm.models import load_model
-        >>> model = load_model("blip2_vicuna_instruct", "vicuna7b")
-    """
+@registry.register_model("my_mmlm_flant5")
+class MyMMLMFlanT5Instruct(Blip2Base):
 
     PRETRAINED_MODEL_CONFIG_DICT = {
-        "vicuna": "configs/models/my_mmlm_vicuna.yaml",
-        "llama2": "configs/models/my_mmlm_llama2.yaml", 
-        "eval_vicuna7b": "../eval_configs/eval_vicuna7b.yaml",
+        "flant5": "configs/models/my_mmlm_flant5.yaml",
+        "eval_flant5": "../eval_configs/eval_flant5.yaml"
     }
 
     def __init__(
@@ -43,20 +35,21 @@ class MyMMLMVicunaInstruct(Blip2Base):
         q_former_model='',
         q_former_config='', 
         freeze_qformer=True,
-        llm_model="",
+        llm_model="google/flan-t5-xl",
         fc_layer='',
         prompt="",
         max_txt_len=128,
         max_output_txt_len=256,
         apply_lemmatizer=False,
+        num_few_shot_examples=0,
+        few_shot_prob=0,
         qformer_text_input=True,
     ):
+        """
+        apply_lemmatizer: when set to True, postprocess predict_answers() result with lemmas.
+        """
         super().__init__()
-        transformers_version = version.parse(transformers.__version__)
-        assert transformers_version >= version.parse("4.28"), "BLIP-2 Vicuna requires transformers>=4.28"        
-        from transformers import LlamaTokenizer
-        from mmlm.models.modeling_llama import LlamaForCausalLM
-        
+
         self.tokenizer = self.init_tokenizer(q_former_config, truncation_side="left")
 
         print('Loading VIT')
@@ -71,26 +64,27 @@ class MyMMLMVicunaInstruct(Blip2Base):
             logging.info("freeze vision encoder")
         print('Loading VIT Done')
 
-        print('Loading LLAMA')
-        self.llm_tokenizer = LlamaTokenizer.from_pretrained(llm_model, use_fast=False, truncation_side="left")
-        self.llm_model = LlamaForCausalLM.from_pretrained(
-            llm_model, torch_dtype=torch.float16,
-        )
-        self.llm_tokenizer.add_special_tokens({'pad_token': '[PAD]'})
-        self.llm_tokenizer.add_special_tokens({'bos_token': '</s>'})
-        self.llm_tokenizer.add_special_tokens({'eos_token': '</s>'})
-        self.llm_tokenizer.add_special_tokens({'unk_token': '</s>'})
+        print('Loading t5')
+        self.t5_tokenizer = T5TokenizerFast.from_pretrained(llm_model, truncation_side='left')
+        self.t5_output_tokenizer = T5TokenizerFast.from_pretrained(llm_model, truncation_side='right')
 
-        self.llm_model.resize_token_embeddings(len(self.llm_tokenizer))
+        t5_config = T5Config.from_pretrained(llm_model)
+        t5_config.dense_act_fn = "gelu"
+        self.llm_model = T5ForConditionalGeneration.from_pretrained(
+            llm_model, config=t5_config
+        )
 
         for name, param in self.llm_model.named_parameters():
             param.requires_grad = False
-        print('Loading LLAMA Done')
+            param.data = param.data.bfloat16()
+        print('Loading t5 Done')
+
 
         print('Loading Q-Former')
         self.Qformer, self.query_tokens = self.init_Qformer(
             q_former_config, num_query_token, self.visual_encoder.num_features
         )
+
         if not qformer_text_input:
             self.Qformer.bert.embeddings.word_embeddings = None
             self.Qformer.bert.embeddings.position_embeddings = None
@@ -101,10 +95,10 @@ class MyMMLMVicunaInstruct(Blip2Base):
             self.Qformer.resize_token_embeddings(len(self.tokenizer))
         self.Qformer.cls = None
 
-        self.llm_proj = nn.Linear(
+        self.t5_proj = nn.Linear(
             self.Qformer.config.hidden_size, self.llm_model.config.hidden_size
         )
-        
+
         self.load_from_pretrained(url_or_filename=q_former_model)
 
         if freeze_qformer:
@@ -123,47 +117,22 @@ class MyMMLMVicunaInstruct(Blip2Base):
         self.max_txt_len = max_txt_len
         self.max_output_txt_len = max_output_txt_len
         self.prompt = prompt
-        prompt_tokens = self.llm_tokenizer(self.prompt, return_tensors="pt")
-        self.prompt_length = prompt_tokens.attention_mask.sum(1)
 
         self._lemmatizer = None
 
+        self.num_few_shot_examples = num_few_shot_examples
+        self.few_shot_prob = few_shot_prob
+
         self.qformer_text_input = qformer_text_input
-
-    def concat_text_input_output(self, input_ids, input_atts, output_ids, output_atts):
-        input_part_targets_len = []
-        llm_tokens = {"input_ids": [], "attention_mask": []}
-        for i in range(input_ids.size(0)):
-            this_input_ones = input_atts[i].sum()
-            input_part_targets_len.append(this_input_ones)
-            llm_tokens['input_ids'].append(
-                torch.cat([
-                    input_ids[i][:this_input_ones],
-                    output_ids[i][1:],
-                    input_ids[i][this_input_ones:]
-                ])
-            )
-            llm_tokens['attention_mask'].append(
-                torch.cat([
-                    input_atts[i][:this_input_ones],
-                    output_atts[i][1:],
-                    input_atts[i][this_input_ones:]
-                ])
-            )
-        llm_tokens['input_ids'] = torch.stack(llm_tokens['input_ids'])
-        llm_tokens['attention_mask'] = torch.stack(llm_tokens['attention_mask'])
-        return llm_tokens, input_part_targets_len
-
+        
     def forward(self, samples):
+
         image = samples["image"]
         with self.maybe_autocast():
             image_embeds = self.ln_vision(self.visual_encoder(image))
         image_atts = torch.ones(image_embeds.size()[:-1], dtype=torch.long).to(image.device)
 
-        bs = image.size(0)
-
         query_tokens = self.query_tokens.expand(image_embeds.shape[0], -1, -1)
-            #self.query_tokens.expand(image_embeds.shape[0], -1, -1)
         if self.qformer_text_input:
             text_Qformer = self.tokenizer(
                 samples["text_input"],
@@ -173,7 +142,7 @@ class MyMMLMVicunaInstruct(Blip2Base):
                 return_tensors="pt",
             ).to(image.device)
             query_atts = torch.ones(query_tokens.size()[:-1], dtype=torch.long).to(image.device)
-            Qformer_atts = torch.cat([query_atts, text_Qformer.attention_mask],dim=1)
+            Qformer_atts = torch.cat([query_atts,text_Qformer.attention_mask],dim=1)
 
             query_output = self.Qformer.bert(
                 text_Qformer.input_ids,
@@ -190,66 +159,58 @@ class MyMMLMVicunaInstruct(Blip2Base):
                 encoder_attention_mask=image_atts,
                 return_dict=True,
             )
-            
-        inputs_llm = self.llm_proj(query_output.last_hidden_state[:,:query_tokens.size(1),:])
+
+        # inputs_llm_proj = torch.concat((query_output.last_hidden_state[:,:query_tokens.size(1)+1,:], 
+        #                                 torch.mean(query_output.last_hidden_state[:,query_tokens.size(1)+1:,:], dim=1, keepdim=True)), 
+        #                                 dim=1)
+        # inputs_llm = self.t5_proj(inputs_llm_proj)
+        inputs_llm = self.t5_proj(query_output.last_hidden_state[:,:query_tokens.size(1),:])
         atts_llm = torch.ones(inputs_llm.size()[:-1], dtype=torch.long).to(image.device)
 
-        self.llm_tokenizer.padding_side = "right"
-        self.llm_tokenizer.truncation_side = 'left'
-        text_input_tokens = self.llm_tokenizer(
-            samples['text_input'],
-            return_tensors="pt",
-            padding="longest",
-            truncation=True,
-            max_length=self.max_txt_len,
-        ).to(image.device)
+        fs_embeds, fs_atts = None, None
+        if self.few_shot_prob > 0 and "few_shot_samples" in samples.keys():
+            fs_embeds, fs_atts = self.prepare_few_shot_embeds(samples['few_shot_samples'])
 
-        self.llm_tokenizer.truncation_side = 'right'
-        text_output_tokens = self.llm_tokenizer(
-            [t + self.llm_tokenizer.eos_token for t in samples['text_output']],
-            return_tensors="pt",
-            padding="longest",
-            truncation=True,
-            max_length=self.max_output_txt_len,
-        ).to(image.device)
+        with self.maybe_autocast(dtype=torch.bfloat16):
+            input_tokens = self.t5_tokenizer(
+                samples["text_input"],
+                padding="longest",
+                truncation=True,
+                max_length=self.max_txt_len,
+                return_tensors="pt",
+            ).to(image.device)
+            output_tokens = self.t5_output_tokenizer(
+                samples["text_output"],
+                padding="longest",
+                truncation=True,
+                max_length=self.max_output_txt_len,
+                return_tensors="pt",
+            ).to(image.device)
 
-        llm_tokens, input_part_targets_len = self.concat_text_input_output(
-            text_input_tokens.input_ids,
-            text_input_tokens.attention_mask,
-            text_output_tokens.input_ids,
-            text_output_tokens.attention_mask,
-        )
+            encoder_atts = torch.cat([atts_llm, input_tokens.attention_mask], dim=1)
 
-        # do not apply loss to the padding
-        targets = llm_tokens['input_ids'].masked_fill(
-            llm_tokens['input_ids'] == self.llm_tokenizer.pad_token_id, -100
-        )
+            targets = output_tokens.input_ids.masked_fill(
+                output_tokens.input_ids == self.t5_tokenizer.pad_token_id, -100
+            )
 
-        # do not apply loss to the text input (i.e., instruction)
-        for i, l in enumerate(input_part_targets_len):
-            targets[i][:l] = -100
+            inputs_embeds = self.llm_model.encoder.embed_tokens(input_tokens.input_ids)
+            inputs_embeds = torch.cat([inputs_llm, inputs_embeds], dim=1)
 
-        # do not apply loss to the query tokens
-        empty_targets = (
-            torch.ones(atts_llm.size(), dtype=torch.long).to(image.device).fill_(-100)
-        )
-        targets = torch.cat([empty_targets, targets], dim=1)
+            if fs_embeds is not None:
+                inputs_embeds = torch.cat([fs_embeds, inputs_embeds], dim=1)
+                encoder_atts = torch.cat([fs_atts, encoder_atts], dim=1)
 
-        inputs_embeds = self.llm_model.get_input_embeddings()(llm_tokens['input_ids'])
-        inputs_embeds = torch.cat([inputs_llm, inputs_embeds], dim=1)
-        attention_mask = torch.cat([atts_llm, llm_tokens['attention_mask']], dim=1)
-
-        with self.maybe_autocast():
             outputs = self.llm_model(
                 inputs_embeds=inputs_embeds,
-                attention_mask=attention_mask,
+                attention_mask=encoder_atts,
+                decoder_attention_mask=output_tokens.attention_mask,
                 return_dict=True,
                 labels=targets,
             )
+            loss = outputs.loss
 
-        loss = outputs.loss
+            return {"loss": loss}
 
-        return {"loss": loss}
 
     @torch.no_grad()
     def generate(
@@ -261,12 +222,10 @@ class MyMMLMVicunaInstruct(Blip2Base):
         min_length=1,
         top_p=0.9,
         repetition_penalty=1.5,
-        length_penalty=1,
+        length_penalty=1.0,
         num_captions=1,
         temperature=1,
     ):
-        self.llm_tokenizer.padding_side = "left"
-
         if "prompt" in samples.keys():
             prompt = samples["prompt"]
         else:
@@ -284,7 +243,7 @@ class MyMMLMVicunaInstruct(Blip2Base):
         # For TextCaps
         if "ocr_tokens" in samples.keys() and "{}" in prompt[0]:
             prompt = [p.format(', '.join(samples['ocr_tokens'][i][:30])) for i, p in enumerate(prompt)]
-
+        
         query_tokens = self.query_tokens.expand(bs, -1, -1)
         if self.qformer_text_input:
             # remove ocr tokens in q_former (for eval textvqa)
@@ -299,21 +258,28 @@ class MyMMLMVicunaInstruct(Blip2Base):
                 return_tensors="pt",
             ).to(image.device)
             query_atts = torch.ones(query_tokens.size()[:-1], dtype=torch.long).to(image.device)
-            Qformer_atts = torch.cat([query_atts, text_Qformer.attention_mask], dim=1)
+            Qformer_atts = torch.cat([query_atts,text_Qformer.attention_mask],dim=1)
 
         # For video data
         if image.dim() == 5:
-            inputs_llm, atts_llm = [], []
+            inputs_t5, atts_t5 = [], []
+            add_inputs_llm, add_atts_llm = [], []
             for j in range(image.size(2)):
                 this_frame = image[:,:,j,:,:]
                 with self.maybe_autocast():
                     frame_embeds = self.ln_vision(self.visual_encoder(this_frame))
-                frame_atts = torch.ones(frame_embeds.size()[:-1], dtype=torch.long).to(image.device)
+                    frame_atts = torch.ones(frame_embeds.size()[:-1], dtype=torch.long).to(image.device)
+                    frame_features =self.visual_encoder.get_intermediate_layers(this_frame)[-2]
+                    
+                frame_features = frame_features[:, 1:] 
+        
+                add_feature_llm = self.vision_project(frame_features) 
+                atts_add_feature_llm = torch.ones(add_feature_llm.size()[:-1], dtype=torch.long).to(image.device)
 
                 if self.qformer_text_input:
                     frame_query_output = self.Qformer.bert(
                         text_Qformer.input_ids,
-                        attention_mask=Qformer_atts,
+                        attention_mask = Qformer_atts,
                         query_embeds=query_tokens,
                         encoder_hidden_states=frame_embeds,
                         encoder_attention_mask=frame_atts,
@@ -326,17 +292,22 @@ class MyMMLMVicunaInstruct(Blip2Base):
                         encoder_attention_mask=frame_atts,
                         return_dict=True,
                     )
-                frame_inputs_llm = self.llm_proj(frame_query_output.last_hidden_state[:,:query_tokens.size(1),:])
-                frame_atts_llm = torch.ones(frame_inputs_llm.size()[:-1], dtype=torch.long).to(image.device)
-                inputs_llm.append(frame_inputs_llm)
-                atts_llm.append(frame_atts_llm)
-            inputs_llm = torch.cat(inputs_llm, dim=1)
-            atts_llm = torch.cat(atts_llm, dim=1)
+
+                frame_inputs_t5 = self.t5_proj(frame_query_output.last_hidden_state[:,:query_tokens.size(1),:])
+                frame_atts_t5 = torch.ones(frame_inputs_t5.size()[:-1], dtype=torch.long).to(image.device)
+                inputs_t5.append(frame_inputs_t5)
+                atts_t5.append(frame_atts_t5)
+                add_inputs_llm.append(add_feature_llm)
+                add_atts_llm.append(atts_add_feature_llm)
+            inputs_t5 = torch.cat(inputs_t5, dim=1)
+            atts_t5 = torch.cat(atts_t5, dim=1)
+            add_feature_llm = torch.cat(add_inputs_llm, dim=1)
+            atts_add_feature_llm = torch.cat(add_atts_llm, dim=1)
         else:
             with self.maybe_autocast():
                 image_embeds = self.ln_vision(self.visual_encoder(image))
             image_atts = torch.ones(image_embeds.size()[:-1], dtype=torch.long).to(image.device)
-
+            
             if self.qformer_text_input:
                 query_output = self.Qformer.bert(
                     text_Qformer.input_ids,
@@ -353,43 +324,45 @@ class MyMMLMVicunaInstruct(Blip2Base):
                     encoder_attention_mask=image_atts,
                     return_dict=True,
                 )
-            
-            inputs_llm = self.llm_proj(query_output.last_hidden_state[:,:query_tokens.size(1),:])
+
+            # inputs_llm_proj = torch.concat((query_output.last_hidden_state[:,:query_tokens.size(1)+1,:], 
+            #                                 torch.mean(query_output.last_hidden_state[:,query_tokens.size(1)+1:,:], dim=1, keepdim=True)), 
+            #                                 dim=1)
+            # inputs_llm = self.t5_proj(inputs_llm_proj)
+            inputs_llm = self.t5_proj(query_output.last_hidden_state[:,:query_tokens.size(1),:])
             atts_llm = torch.ones(inputs_llm.size()[:-1], dtype=torch.long).to(image.device)
 
-        llm_tokens = self.llm_tokenizer(
-            prompt if "self_prompt" not in samples.keys() else samples["self_prompt"],
+        input_tokens = self.t5_tokenizer(
+            prompt,
             padding="longest",
             return_tensors="pt"
         ).to(image.device)
 
-        with self.maybe_autocast():
-            inputs_embeds = self.llm_model.get_input_embeddings()(llm_tokens.input_ids)
+        encoder_atts = torch.cat([atts_llm, input_tokens.attention_mask], dim=1)
+
+        with self.maybe_autocast(dtype=torch.bfloat16):
+            inputs_embeds = self.llm_model.encoder.embed_tokens(input_tokens.input_ids)
             inputs_embeds = torch.cat([inputs_llm, inputs_embeds], dim=1)
-            attention_mask = torch.cat([atts_llm, llm_tokens.attention_mask], dim=1)
 
             outputs = self.llm_model.generate(
                 inputs_embeds=inputs_embeds,
-                attention_mask=attention_mask,
+                attention_mask=encoder_atts,
                 do_sample=use_nucleus_sampling,
                 top_p=top_p,
                 temperature=temperature,
                 num_beams=num_beams,
-                max_length=max_length,
+                max_new_tokens=max_length,
                 min_length=min_length,
-                # eos_token_id=self.eos_token_id,
                 repetition_penalty=repetition_penalty,
                 length_penalty=length_penalty,
                 num_return_sequences=num_captions,
             )
-
-        outputs[outputs == 0] = 2 # convert output id 0 to 2 (eos_token_id)
-        output_text = self.llm_tokenizer.batch_decode(outputs, skip_special_tokens=True)
-        output_text = [text.strip() for text in output_text]
+            output_text = self.t5_tokenizer.batch_decode(
+                outputs, skip_special_tokens=True
+            )
 
         return output_text
 
-    @torch.no_grad()
     def predict_answers(
         self,
         samples,
@@ -400,7 +373,7 @@ class MyMMLMVicunaInstruct(Blip2Base):
         num_ans_candidates=128,
         answer_list=None,
         prompt="",
-        length_penalty=0,
+        length_penalty=-1,
         **kwargs
     ):
         if isinstance(samples["text_input"], str):
@@ -437,16 +410,13 @@ class MyMMLMVicunaInstruct(Blip2Base):
             output_text = self._lemmatize(output_text)
 
         return output_text
-    
-    @torch.no_grad()
+
     def predict_class(
         self,
         samples,
         candidates,
         n_segments=1,
     ):
-        self.llm_tokenizer.padding_side = "left"
-
         # If candidates is a list of lists, each sample has its candidates, then we need to iterate one by one
         if type(candidates[0]) == list:
             results = []
@@ -454,7 +424,7 @@ class MyMMLMVicunaInstruct(Blip2Base):
             for i in range(samples["image"].size(0)):
                 this_sample = {
                     "image": samples["image"][i].unsqueeze(0),
-                    "prompt": samples["prompt"],
+                    "prompt": samples["prompt"][i],
                 }
 
                 if "text_input" in samples.keys():
@@ -480,14 +450,26 @@ class MyMMLMVicunaInstruct(Blip2Base):
             return results
 
         return self._predict_class(samples, candidates, n_segments)
-    
-    @torch.no_grad()
+
     def _predict_class(
         self,
         samples,
         candidates,
         n_segments=1,
     ):
+        """
+        Args:
+            samples (dict): A dictionary containing the following keys:
+                - image (torch.Tensor): A tensor of shape (batch_size, 3, H, W)
+                - prompt: the instruction
+            candidates:
+                (list): A list of candidate class names;
+            n_segments:
+                (int): Split the candidates into n_segments and predict one by one. This is useful when the number of candidates is too large.
+        Returns:
+            output_class: predicted class index
+        """
+
         image = samples["image"]
         prompt = samples["prompt"]
 
@@ -529,16 +511,22 @@ class MyMMLMVicunaInstruct(Blip2Base):
                 return_tensors="pt"
             ).to(image.device)
             query_atts = torch.ones(query_tokens.size()[:-1], dtype=torch.long).to(image.device)
-            Qformer_atts = torch.cat([query_atts, text_Qformer.attention_mask], dim=1)
+            Qformer_atts = torch.cat([query_atts,text_Qformer.attention_mask], dim=1)
 
         if image.dim() == 5:
-            inputs_llm, atts_llm = [], []
+            inputs_t5, atts_t5 = [], []
+            add_inputs_llm, add_atts_llm = [], []
             for j in range(image.size(2)):
                 this_frame = image[:,:,j,:,:]
                 with self.maybe_autocast():
                     frame_embeds = self.ln_vision(self.visual_encoder(this_frame))
                     frame_atts = torch.ones(frame_embeds.size()[:-1], dtype=torch.long).to(image.device)
-
+                    frame_features =self.visual_encoder.get_intermediate_layers(this_frame)[-2]
+                    
+                frame_features = frame_features[:, 1:] 
+        
+                add_feature_llm = self.vision_project(frame_features) 
+                atts_add_feature_llm = torch.ones(add_feature_llm.size()[:-1], dtype=torch.long).to(image.device)
                 if self.qformer_text_input:
                     frame_query_output = self.Qformer.bert(
                         text_Qformer.input_ids,
@@ -556,12 +544,16 @@ class MyMMLMVicunaInstruct(Blip2Base):
                         return_dict=True,
                     )
 
-                frame_inputs_llm = self.llm_proj(frame_query_output.last_hidden_state[:,:query_tokens.size(1),:])
-                frame_atts_llm = torch.ones(frame_inputs_llm.size()[:-1], dtype=torch.long).to(image.device)
-                inputs_llm.append(frame_inputs_llm)
-                atts_llm.append(frame_atts_llm)
-            inputs_llm = torch.cat(inputs_llm, dim=1)
-            atts_llm = torch.cat(atts_llm, dim=1)
+                frame_inputs_t5 = self.t5_proj(frame_query_output.last_hidden_state[:,:query_tokens.size(1),:])
+                frame_atts_t5 = torch.ones(frame_inputs_t5.size()[:-1], dtype=torch.long).to(image.device)
+                inputs_t5.append(frame_inputs_t5)
+                atts_t5.append(frame_atts_t5)
+                add_inputs_llm.append(add_feature_llm)
+                add_atts_llm.append(atts_add_feature_llm)
+            inputs_t5 = torch.cat(inputs_t5, dim=1)
+            atts_t5 = torch.cat(atts_t5, dim=1)
+            add_feature_llm = torch.cat(add_inputs_llm, dim=1)
+            atts_add_feature_llm = torch.cat(add_atts_llm, dim=1)
         else:
             with self.maybe_autocast():
                 image_embeds = self.ln_vision(self.visual_encoder(image))
@@ -584,83 +576,72 @@ class MyMMLMVicunaInstruct(Blip2Base):
                     return_dict=True,
                 )
 
-            inputs_llm = self.llm_proj(query_output.last_hidden_state[:,:query_tokens.size(1),:])
+            # inputs_llm_proj = torch.concat((query_output.last_hidden_state[:,:query_tokens.size(1)+1,:], 
+            #                                 torch.mean(query_output.last_hidden_state[:,query_tokens.size(1)+1:,:], dim=1, keepdim=True)), 
+            #                                 dim=1)
+            # inputs_llm = self.t5_proj(inputs_llm_proj)
+            inputs_llm = self.t5_proj(query_output.last_hidden_state[:,:query_tokens.size(1),:])
             atts_llm = torch.ones(inputs_llm.size()[:-1], dtype=torch.long).to(image.device)
 
-        self.llm_tokenizer.padding_side = "right"
-        self.llm_tokenizer.truncation_side = 'left'
-        text_input_tokens = self.llm_tokenizer(
-            prompt,
-            return_tensors="pt",
-            padding="longest",
-            # truncation=True,
-            # max_length=self.max_txt_len,
+        input_tokens = self.t5_tokenizer(
+            prompt, padding="longest", return_tensors="pt"
+        ).to(image.device)
+        output_tokens = self.t5_tokenizer(
+            candidates, padding="longest", return_tensors="pt"
         ).to(image.device)
 
-        empty_targets = torch.ones(atts_llm.size(), dtype=torch.long).to(image.device).fill_(-100)
+        encoder_atts = torch.cat([atts_llm, input_tokens.attention_mask], dim=1)
 
-        # self.llm_tokenizer.padding_side = "right"
-        self.llm_tokenizer.truncation_side = 'right'
         n_cands = len(candidates)
+
         with self.maybe_autocast(dtype=torch.bfloat16):
+            inputs_embeds = self.llm_model.encoder.embed_tokens(input_tokens.input_ids)
+            inputs_embeds = torch.cat([inputs_llm, inputs_embeds], dim=1)
+
+            encoder_outputs = self.llm_model.encoder(
+                inputs_embeds=inputs_embeds,
+                attention_mask=encoder_atts,
+            )
+
             all_losses = []
             for n in range(n_segments):
                 seg_len = n_cands // n_segments
                 if n == (n_segments - 1):
                     seg_len = n_cands - seg_len * (n_segments - 1)
 
-                start_i = n * (n_cands // n_segments)
-                end_i = start_i + seg_len
-
-                this_output_tokens = self.llm_tokenizer(
-                    candidates[start_i:end_i],
-                    return_tensors="pt",
-                    padding="longest",
-                    # truncation=True,
-                    # max_length=self.max_output_txt_len,
-                ).to(image.device)
-
-                this_input_tokens_ids = text_input_tokens.input_ids.repeat_interleave(seg_len, dim=0)
-                this_input_tokens_atts = text_input_tokens.attention_mask.repeat_interleave(seg_len, dim=0)
-
-                this_output_tokens_ids = this_output_tokens.input_ids.repeat(bs, 1)
-                this_output_tokens_atts = this_output_tokens.attention_mask.repeat(bs, 1)
-
-                this_llm_tokens, this_input_targets_len = self.concat_text_input_output(
-                    this_input_tokens_ids,
-                    this_input_tokens_atts,
-                    this_output_tokens_ids,
-                    this_output_tokens_atts
+                # this_encoder_outputs = copy.deepcopy(encoder_outputs)
+                this_encoder_outputs = BaseModelOutput(
+                    last_hidden_state=encoder_outputs[0].clone(),
                 )
 
-                this_llm_input_ids = this_llm_tokens['input_ids']
-                this_llm_atts = this_llm_tokens['attention_mask']
-                
-                inputs_embeds = self.llm_model.get_input_embeddings()(this_llm_input_ids)
-                inputs_embeds = torch.cat([inputs_llm.repeat_interleave(seg_len, dim=0), inputs_embeds], dim=1)
-                attention_mask = torch.cat([atts_llm.repeat_interleave(seg_len, dim=0), this_llm_atts], dim=1)
+                this_encoder_outputs['last_hidden_state'] = this_encoder_outputs[0].repeat_interleave(seg_len, dim=0)
+                this_encoder_atts = encoder_atts.repeat_interleave(seg_len, dim=0)
 
-                this_targets = this_llm_input_ids.masked_fill(this_llm_input_ids == self.llm_tokenizer.pad_token_id, -100)
-                # this_targets[:, :this_input_tokens_ids.size(1)] = -100
-                for i, l in enumerate(this_input_targets_len):
-                    this_targets[i][:l] = -100
+                start_i = n * (n_cands // n_segments)
+                end_i = start_i + seg_len
+                this_output_tokens_ids = output_tokens.input_ids[start_i:end_i].repeat(bs, 1)
+                this_output_tokens_atts = output_tokens.attention_mask[start_i:end_i].repeat(bs, 1)
 
-                this_targets = torch.cat([empty_targets.repeat_interleave(seg_len, dim=0), this_targets], dim=1)
+                this_targets = this_output_tokens_ids.masked_fill(this_output_tokens_ids == self.t5_tokenizer.pad_token_id, -100)
 
                 outputs = self.llm_model(
-                    inputs_embeds=inputs_embeds,
-                    attention_mask=attention_mask,
+                    encoder_outputs=this_encoder_outputs,
+                    attention_mask=this_encoder_atts,
+                    decoder_attention_mask=this_output_tokens_atts,
                     return_dict=True,
                     labels=this_targets,
                     reduction="none",
                 )
-
                 loss = outputs.loss.tolist()
 
+                # loss = loss.reshape(bs, seg_len)
                 all_losses += loss
+                # output_class_ranks = torch.argsort(loss, dim=-1)
+                # all_losses.append(loss)
 
+            # all_losses = torch.cat(all_losses, dim=-1)
+            # output_class_ranks = torch.argsort(all_losses, dim=-1)[0]
             output_class_ranks = [i[0] for i in sorted(enumerate(all_losses), key=lambda x:x[1])]
-
 
         return output_class_ranks
 
@@ -674,6 +655,10 @@ class MyMMLMVicunaInstruct(Blip2Base):
             prompt = [prompt] * bs
         else:
             assert len(prompt) == bs, "The number of prompts must be equal to the batch size."
+        
+        with self.maybe_autocast():
+            image_embeds = self.ln_vision(self.visual_encoder(image))
+        image_atts = torch.ones(image_embeds.size()[:-1], dtype=torch.long).to(image.device)
 
         query_tokens = self.query_tokens.expand(bs, -1, -1)
         if self.qformer_text_input:
@@ -682,83 +667,77 @@ class MyMMLMVicunaInstruct(Blip2Base):
                 padding='longest',
                 truncation=True,
                 max_length=self.max_txt_len,
-                return_tensors="pt"
+                return_tensors="pt",
             ).to(image.device)
             query_atts = torch.ones(query_tokens.size()[:-1], dtype=torch.long).to(image.device)
-            Qformer_atts = torch.cat([query_atts, text_Qformer.attention_mask], dim=1)
-        
-        with self.maybe_autocast():
-                image_embeds = self.ln_vision(self.visual_encoder(image))
-        image_atts = torch.ones(image_embeds.size()[:-1], dtype=torch.long).to(image.device)
+            Qformer_atts = torch.cat([query_atts,text_Qformer.attention_mask],dim=1)
 
-        query_output = self.Qformer.bert(
-            text_Qformer.input_ids,
-            attention_mask=Qformer_atts,
-            query_embeds=query_tokens,
-            encoder_hidden_states=image_embeds,
-            encoder_attention_mask=image_atts,
-            return_dict=True,
-        )
+            query_output = self.Qformer.bert(
+                text_Qformer.input_ids,
+                attention_mask=Qformer_atts,
+                query_embeds=query_tokens,
+                encoder_hidden_states=image_embeds,
+                encoder_attention_mask=image_atts,
+                return_dict=True,
+            )
+        else:
+            query_output = self.Qformer.bert(
+                query_embeds=query_tokens,
+                encoder_hidden_states=image_embeds,
+                encoder_attention_mask=image_atts,
+                return_dict=True,
+            )
 
-        inputs_llm = self.llm_proj(query_output.last_hidden_state[:,:query_tokens.size(1),:])
+        # inputs_llm_proj = torch.concat((query_output.last_hidden_state[:,:query_tokens.size(1)+1,:], 
+        #                                 torch.mean(query_output.last_hidden_state[:,query_tokens.size(1)+1:,:], dim=1, keepdim=True)), 
+        #                                 dim=1)
+        # inputs_llm = self.t5_proj(inputs_llm_proj)
+        inputs_llm = self.t5_proj(query_output.last_hidden_state[:,:query_tokens.size(1),:])
         atts_llm = torch.ones(inputs_llm.size()[:-1], dtype=torch.long).to(image.device)
 
-        self.llm_tokenizer.padding_side = "right"
-        self.llm_tokenizer.truncation_side = 'left'
-        text_input_tokens = self.llm_tokenizer(
-            samples['text_input'],
-            return_tensors="pt",
-            padding="longest",
-            truncation=True,
-            max_length=self.max_txt_len,
-        ).to(image.device)
+        fs_embeds, fs_atts = None, None
+        if self.few_shot_prob > 0 and "few_shot_samples" in samples.keys():
+            fs_embeds, fs_atts = self.prepare_few_shot_embeds(samples['few_shot_samples'])
 
-        self.llm_tokenizer.truncation_side = 'right'
-        x = samples['prompt'] + self.llm_tokenizer.eos_token
-        text_output_tokens = self.llm_tokenizer(
-            samples['prompt'] + self.llm_tokenizer.eos_token,
-            return_tensors="pt",
-            padding="longest",
-            truncation=True,
-            max_length=self.max_output_txt_len,
-        ).to(image.device)
+        with self.maybe_autocast(dtype=torch.bfloat16):
+            input_tokens = self.t5_tokenizer(
+                samples["text_input"],
+                padding="longest",
+                truncation=True,
+                max_length=self.max_txt_len,
+                return_tensors="pt",
+            ).to(image.device)
+            output_tokens = self.t5_output_tokenizer(
+                samples["prompt"],
+                padding="longest",
+                truncation=True,
+                max_length=self.max_output_txt_len,
+                return_tensors="pt",
+            ).to(image.device)
 
-        llm_tokens, input_part_targets_len = self.concat_text_input_output(
-            text_input_tokens.input_ids,
-            text_input_tokens.attention_mask,
-            text_output_tokens.input_ids,
-            text_output_tokens.attention_mask,
-        )
+            encoder_atts = torch.cat([atts_llm, input_tokens.attention_mask], dim=1)
 
-        # do not apply score to the padding
-        targets = llm_tokens['input_ids'].masked_fill(
-            llm_tokens['input_ids'] == self.llm_tokenizer.pad_token_id, -100
-        )
+            targets = output_tokens.input_ids.masked_fill(
+                output_tokens.input_ids == self.t5_tokenizer.pad_token_id, -100
+            )
 
-        # do not apply score to the prompt
-        for i, l in enumerate(input_part_targets_len):
-            targets[i][:l] = -100
+            inputs_embeds = self.llm_model.encoder.embed_tokens(input_tokens.input_ids)
+            inputs_embeds = torch.cat([inputs_llm, inputs_embeds], dim=1)
 
-        # do not apply score to the query tokens
-        empty_targets = (
-            torch.ones(atts_llm.size(), dtype=torch.long).to(image.device).fill_(-100)
-        )
-        targets = torch.cat([empty_targets, targets], dim=1)
+            if fs_embeds is not None:
+                inputs_embeds = torch.cat([fs_embeds, inputs_embeds], dim=1)
+                encoder_atts = torch.cat([fs_atts, encoder_atts], dim=1)
 
-        inputs_embeds = self.llm_model.get_input_embeddings()(llm_tokens['input_ids'])
-        inputs_embeds = torch.cat([inputs_llm, inputs_embeds], dim=1)
-        attention_mask = torch.cat([atts_llm, llm_tokens['attention_mask']], dim=1)
-
-        with self.maybe_autocast():
             outputs = self.llm_model(
                 inputs_embeds=inputs_embeds,
-                attention_mask=attention_mask,
+                attention_mask=encoder_atts,
+                decoder_attention_mask=output_tokens.attention_mask,
                 return_dict=True,
                 labels=targets,
             )
+            loss = outputs.loss
 
-        score = outputs.loss
-        return score
+            return loss
 
     def _lemmatize(self, answers):
         def apply(answer):
@@ -821,6 +800,9 @@ class MyMMLMVicunaInstruct(Blip2Base):
 
         apply_lemmatizer = cfg.get("apply_lemmatizer", False)
 
+        num_few_shot_examples = cfg.get("num_few_shot_examples", 0)
+        few_shot_prob = cfg.get("few_shot_prob", 0.0)
+
         qformer_text_input = cfg.get("qformer_text_input", True)
 
         model = cls(
@@ -841,9 +823,11 @@ class MyMMLMVicunaInstruct(Blip2Base):
             max_txt_len=max_txt_len,
             max_output_txt_len=max_output_txt_len,
             apply_lemmatizer=apply_lemmatizer,
+            num_few_shot_examples=num_few_shot_examples,
+            few_shot_prob=few_shot_prob,
             qformer_text_input=qformer_text_input,
         )
 
-        # model.load_checkpoint_from_config(cfg) 
+        # model.load_checkpoint_from_config(cfg)
 
         return model

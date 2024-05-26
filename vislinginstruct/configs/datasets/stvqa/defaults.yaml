@@ -1,0 +1,6 @@
+datasets:
+  stvqa:
+    data_type: images
+    build_info:
+      storage: vislinginstruct/data/STVQA
+      vis_root: vislinginstruct/data/STVQA/train

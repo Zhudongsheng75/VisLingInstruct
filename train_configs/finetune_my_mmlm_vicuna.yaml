@@ -1,0 +1,71 @@
+model:
+  arch: my_mmlm_vicuna 
+  model_type: vicuna
+
+  # vit encoder
+  image_size: 224
+  drop_path_rate: 0
+  use_grad_checkpoint: False
+  vit_precision: "fp16"
+  freeze_vit: True 
+  vit_model_path: "/root/paddlejob/workspace/env_run/afs_01/freeze_weight/eva_vit_g.pth"
+
+  # Q-Former
+  num_query_token: 32
+  q_former_config: "/root/paddlejob/workspace/env_run/afs_01/freeze_weight/bert-base-uncased"
+  q_former_model: "/root/paddlejob/workspace/env_run/afs_01/qformer/instruct_blip_vicuna7b_trimmed.pth"
+  fc_layer: "/root/paddlejob/workspace/env_run/afs_01/fully_connected_layer/stage1_output/7b/pretrained_minigpt4_7b_stage1.pth"
+  freeze_qformer: True
+
+  # path to Vicuna checkpoint
+  llm_model: "/root/paddlejob/workspace/env_run/afs_01/freeze_weight/vicuna_7b_v1.1"
+
+  # generation configs
+  prompt: ""
+  max_txt_len: 512
+  max_output_txt_len: 256
+
+
+datasets:
+  llava_instruct_150k:
+    data_type: images
+    build_info:
+      storage: /root/paddlejob/workspace/env_run/afs_02/llava_instruction
+      vis_root: /root/paddlejob/workspace/env_run/afs_02/llava_instruction/train2014
+
+
+run:
+  runner: runner_iter
+
+  task: image_text_pretrain
+  # optimizer
+  lr_sched: "linear_warmup_cosine_lr"
+  init_lr: 1e-5
+  min_lr: 0
+  warmup_lr: 1e-8
+
+  weight_decay: 0.05
+  # max_epoch: 3 
+  accum_grad_iters: 1
+  
+  max_iters: 15000
+  iters_per_inner_epoch: 1000
+
+  batch_size_train: 4
+  batch_size_eval: 1 
+  num_workers: 2
+  warmup_steps: 200
+
+  seed: 42
+  output_dir: "/root/paddlejob/workspace/env_run/output/vicuna_stage2/7b"
+
+  amp: True
+  resume_ckpt_path: null
+
+  evaluate: False 
+  train_splits: ["train"]
+
+  device: "cuda"
+  world_size: 1
+  dist_url: "env://"
+  distributed: True

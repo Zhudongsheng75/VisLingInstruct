@@ -1,0 +1,10 @@
+datasets:
+  cc3m:
+    vis_processor:
+        train:
+          name: "blip_image_train"
+          image_size: 224
+    text_processor:
+        train:
+          name: "blip_caption"
+      

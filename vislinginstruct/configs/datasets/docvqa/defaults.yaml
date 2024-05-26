@@ -1,0 +1,6 @@
+datasets:
+  docvqa:
+    data_type: images
+    build_info:
+      storage: vislinginstruct/data/DocVQA/train
+      vis_root: vislinginstruct/data/DocVQA/train
